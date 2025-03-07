@@ -1,6 +1,5 @@
 plugins {
     id 'java'
-//    id 'org.springframework.boot' version '3.4.3'
     id 'org.springframework.boot' version '2.7.18'
     id 'io.spring.dependency-management' version '1.1.4'
 }
@@ -20,7 +19,7 @@ repositories {
 }
 
 ext {
-//    set('springShellVersion', "3.4.0")
+    springBootVersion = '2.7.18'
 }
 
 dependencies {

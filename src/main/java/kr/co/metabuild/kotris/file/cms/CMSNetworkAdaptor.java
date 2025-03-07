@@ -2,6 +2,7 @@ package kr.co.metabuild.kotris.file.cms;
 
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufUtil;
 import io.netty.channel.*;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioSocketChannel;
@@ -20,6 +21,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.BlockingDeque;
 import java.util.concurrent.LinkedBlockingDeque;
+import java.util.concurrent.TimeUnit;
 
 public class CMSNetworkAdaptor {
     private static final Logger logger = LoggerFactory.getLogger(CMSNetworkAdaptor.class);
@@ -121,9 +123,33 @@ public class CMSNetworkAdaptor {
             int recallCountNo0640 = 0;
             boolean nextStep = false;
 
-            ByteBuf sendData = null;
+            ByteBuf workStartResponse = null;
             while (!nextStep && recallCountNo0610 <= messageResendCount) {
-//                ByteBuf workStartRequest =
+                ByteBuf workStartRequest = CMSMessage.workStartRequest(orgCode, "R", "", request.getUserName(), request.getUserPassword(), sendDataStr);
+                logger.debug("TransferType: {}, Request [{}], tx[{}] : {}", "OutBound", workStartRequest, "0600", "workStartRequest");
+                conn.writeAndFlush(workStartRequest).awaitUninterruptibly();
+
+
+                /********************************************************************************************
+                 * . 업무 개시 응답[0610]
+                 ********************************************************************************************/
+                workStartResponse = responseQueue.poll(60, TimeUnit.SECONDS);
+                if (workStartResponse == null) {
+                    recallCountNo0610++;
+                    logger.debug("[0610] Read Timeout 60초 발생");
+                    logger.debug("[0600/001] 전문 재전송");
+                    continue;
+                } else {
+                    nextStep = true;
+                }
+
+                if (!nextStep) {
+                    throw new EAIException("Can not receive [0610] Message.");
+                }
+
+                // 파일송수신완료 응답(0610/003)
+                logger.debug("TransferType: {}, Request [{}], tx[{}] : {}", "InBound", workStartRequest, "0610", "fileSendCompleteResponse");
+
             }
 
 

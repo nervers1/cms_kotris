@@ -161,7 +161,7 @@ public class ByteUtil {
     // Integer Conversions
 
     /**
-     * This function converts a integer to its corresponding byte array format.
+     * This function converts an integer to its corresponding byte array format.
      *
      * @param i The integer to be converted.
      * @return The corresponding byte array.
@@ -174,7 +174,7 @@ public class ByteUtil {
 
 
     /**
-     * This function converts a integer into its corresponding byte format and inserts
+     * This function converts an integer into its corresponding byte format and inserts
      * it into the specified buffer.
      *
      * @param i      The integer to be converted.
@@ -187,7 +187,7 @@ public class ByteUtil {
 
 
     /**
-     * This function converts a integer into its corresponding byte format and inserts
+     * This function converts an integer into its corresponding byte format and inserts
      * it into the specified buffer at the specified index.
      *
      * @param i      The integer to be converted.
@@ -639,8 +639,7 @@ public class ByteUtil {
      * @return A copy of the byte array.
      */
     public static byte[] copy(byte[] bytes) {
-        byte[] result = Arrays.copyOf(bytes, bytes.length);
-        return result;
+        return Arrays.copyOf(bytes, bytes.length);
     }
 
 
@@ -649,7 +648,7 @@ public class ByteUtil {
      *
      * @param first  The first byte array.
      * @param second The second byte array.
-     * @return Whether or not the two byte arrays are equal.
+     * @return Whether or not, the two byte arrays are equal.
      */
     public static boolean equals(byte[] first, byte[] second) {
         return Arrays.equals(first, second);
@@ -661,7 +660,7 @@ public class ByteUtil {
      *
      * @param first  The first byte array.
      * @param second The second byte array.
-     * @return The signum result of the comparison.
+     * @return The sign Num result of the comparison.
      */
     public static int compare(byte[] first, byte[] second) {
         // choose the shorter array length
