@@ -1,9 +1,13 @@
 package kr.co.metabuild.kotris.util;
 
+import io.netty.buffer.ByteBuf;
+import io.netty.util.CharsetUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.math.*;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 
 public class ByteUtil {
@@ -776,6 +780,122 @@ public class ByteUtil {
         System.arraycopy(data.getBytes(), 0, newData, offset, len);
 
         return newData;
+    }
+
+    /**
+     * 주어진 ByteBuf에서 지정된 offset과 length에 해당하는 영역을 UTF-8 문자열로 변환하여 반환합니다.
+     *
+     * @param bb     변환할 ByteBuf (null이 아니어야 합니다)
+     * @param offset 시작 인덱스(0부터 시작하는 바이트 위치)
+     * @param length 읽어올 바이트의 수
+     * @return 해당 영역을 UTF-8로 디코딩한 문자열
+     * @throws IllegalArgumentException     bb가 null인 경우
+     * @throws IndexOutOfBoundsException    offset 또는 length가 올바르지 않은 경우
+     */
+    public static String getSubString(ByteBuf bb, int offset, int length) {
+        if (bb == null) {
+            throw new IllegalArgumentException("ByteBuf cannot be null");
+        }
+
+        // offset과 length가 bb 용량 범위를 벗어나지 않는지 (또는 원하는 읽기 범위) 확인
+        if (offset < 0 || length < 0 || offset + length > bb.capacity()) {
+            throw new IndexOutOfBoundsException("Invalid offset or length");
+        }
+
+        // toString(offset, length, Charset) : 지정 위치부터 지정 길이만큼의 데이터를 해당 인코딩 방식으로 디코딩하여 문자열로 변환.
+        return bb.toString(offset, length, Charset.forName("EUC-KR"));
+    }
+
+
+    /**
+     * 주어진 offset부터 length만큼의 바이트를 지정된 Charset을 이용해 문자열로 변환합니다.
+     *
+     * @param buf     데이터가 담긴 ByteBuf
+     * @param offset  읽기 시작 인덱스
+     * @param length  읽을 바이트 수 (문자열의 바이트 길이)
+     * @param charset 문자열 인코딩 방식
+     * @return 추출한 문자열
+     * @throws IndexOutOfBoundsException 만약 buf의 크기가 offset+length보다 작다면
+     */
+    public static String extractString(ByteBuf buf, int offset, int length, Charset charset) {
+        if (buf.capacity() < offset + length) {
+            throw new IndexOutOfBoundsException("Buffer capacity is less than offset + length.");
+        }
+        return buf.toString(offset, length, charset);
+    }
+
+
+    /**
+     * 기본 Charset (UTF-8)을 사용하여 주어진 offset부터 length만큼의 바이트를 문자열로 변환합니다.
+     *
+     * @param buf    데이터가 담긴 ByteBuf
+     * @param offset 읽기 시작 인덱스
+     * @param length 읽을 바이트 수 (문자열의 바이트 길이)
+     * @return 추출한 문자열
+     */
+    public static String extractString(ByteBuf buf, int offset, int length) {
+        return extractString(buf, offset, length, StandardCharsets.UTF_8);
+    }
+
+
+    /**
+     * 주어진 offset에서 4바이트를 읽어 int 값을 추출합니다.
+     *
+     * @param buf     데이터가 담긴 ByteBuf
+     * @param offset  읽기 시작 인덱스
+     * @param length 읽을 길이(반드시 4여야 함)
+     * @return 추출한 int 값
+     * @throws IllegalArgumentException length가 4가 아니면 발생
+     * @throws IndexOutOfBoundsException 만약 buf의 크기가 offset+4보다 작다면
+     */
+    public static int extractInt(ByteBuf buf, int offset, int length) {
+        if (length != 4) {
+            throw new IllegalArgumentException("Int extraction requires length of 4 bytes, but got " + length);
+        }
+        if (buf.capacity() < offset + 4) {
+            throw new IndexOutOfBoundsException("Not enough bytes in the buffer for int extraction.");
+        }
+        return buf.getInt(offset);
+    }
+
+
+    /**
+     * 주어진 offset에서 8바이트를 읽어 long 값을 추출합니다.
+     *
+     * @param buf     데이터가 담긴 ByteBuf
+     * @param offset  읽기 시작 인덱스
+     * @param length 읽을 길이(반드시 8이어야 함)
+     * @return 추출한 long 값
+     * @throws IllegalArgumentException length가 8이 아니면 발생
+     * @throws IndexOutOfBoundsException 만약 buf의 크기가 offset+8보다 작다면
+     */
+    public static long extractLong(ByteBuf buf, int offset, int length) {
+        if (length != 8) {
+            throw new IllegalArgumentException("Long extraction requires length of 8 bytes, but got " + length);
+        }
+        if (buf.capacity() < offset + 8) {
+            throw new IndexOutOfBoundsException("Not enough bytes in the buffer for long extraction.");
+        }
+        return buf.getLong(offset);
+    }
+
+
+    /**
+     * 주어진 offset부터 length만큼의 바이트를 읽어 byte 배열로 반환합니다.
+     *
+     * @param buf    데이터가 담긴 ByteBuf
+     * @param offset 읽기 시작 인덱스
+     * @param length 읽을 바이트 수
+     * @return 추출한 byte 배열
+     * @throws IndexOutOfBoundsException 만약 buf의 크기가 offset+length보다 작다면
+     */
+    public static byte[] extractBytes(ByteBuf buf, int offset, int length) {
+        if (buf.capacity() < offset + length) {
+            throw new IndexOutOfBoundsException("Not enough bytes in the buffer for byte array extraction.");
+        }
+        byte[] bytes = new byte[length];
+        buf.getBytes(offset, bytes);
+        return bytes;
     }
 
 }

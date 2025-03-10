@@ -10,6 +10,8 @@ public class FileInfo {
     String name;
     // 파일사이즈
     long size;
+    // 전문 Byte 수
+    long bytes;
 
 
     /**
@@ -31,6 +33,13 @@ public class FileInfo {
         this.size = size;
     }
 
+    public long getBytes() {
+        return bytes;
+    }
+
+    public void setBytes(long bytes) {
+        this.bytes = bytes;
+    }
 
     /**
      * Equals & HashCode
@@ -39,14 +48,13 @@ public class FileInfo {
     public boolean equals(Object o) {
         if (!(o instanceof FileInfo)) return false;
         FileInfo fileInfo = (FileInfo) o;
-        return getSize() == fileInfo.getSize() && Objects.equals(getName(), fileInfo.getName());
+        return getSize() == fileInfo.getSize() && getBytes() == fileInfo.getBytes() && Objects.equals(getName(), fileInfo.getName());
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(getName(), getSize());
+        return Objects.hash(getName(), getSize(), getBytes());
     }
-
 
     /**
      * toString
@@ -56,6 +64,7 @@ public class FileInfo {
         return "FileInfo{" +
                 "name='" + name + '\'' +
                 ", size=" + size +
+                ", bytes=" + bytes +
                 '}';
     }
 }

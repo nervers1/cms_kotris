@@ -25,7 +25,7 @@ public class CMSUtil {
     public static Map<String, Object> getMetaProp(String propName) {
         String path = "properties/" + propName + ".properties";
         String propPath = Objects.requireNonNull(Thread.currentThread().getContextClassLoader().getResource(path)).getPath();
-        logger.debug("프로퍼티 경로 ---> {}", propPath);
+//        logger.debug("프로퍼티 경로 ---> {}", propPath);
 
         final Properties prop = new Properties();
 
@@ -133,6 +133,18 @@ public class CMSUtil {
     public static void printProp(String key) {
         String value = CMSUtil.getProperty(key);
         System.out.println(key + ":" + value);
-        logger.info(">> {} = {}", key, value);
+        logger.debug(">> {} = {}", key, value);
+    }
+
+    public static void printEnv() {
+        logger.debug( "env = {}", environment() );
+    }
+
+    public static void printMeta() {
+
+        Map<String, Object> cms = CMSUtil.getMetaProp("cms");
+        List<Map<String, Object>> fields = CMSUtil.getFieldList(cms, "cms");
+        logger.debug("cms : {}", cms);
+        logger.debug("fields : {}", fields);
     }
 }
