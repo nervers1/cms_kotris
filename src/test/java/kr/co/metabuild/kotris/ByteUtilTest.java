@@ -11,7 +11,7 @@ public class ByteUtilTest {
     @Test
     public void testPad() {
         String a = "한글";
-        logger.debug("[{}], {}", a, a.getBytes().length);
+        logger.debug("[{}], {}", a, a.length);
         byte[] b = ByteUtil.setString(a, 10);
         logger.debug("[{}], {}", new String(b), b.length);
         byte[] c = ByteUtil.setString(a, 10);
@@ -22,7 +22,7 @@ public class ByteUtilTest {
 
         String a1 = "한글한글한글한글한글한글";
         String a2 = "1234567890";
-        logger.debug("[{}], {}", a1, a1.getBytes().length);
+        logger.debug("[{}], {}", a1, a1.length);
         logger.debug("-----");
         byte[] b1 = ByteUtil.setString(a1, 10);
         logger.debug("[{}], {}", new String(b1), b1.length);

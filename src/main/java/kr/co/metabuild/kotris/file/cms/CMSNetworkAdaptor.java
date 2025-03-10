@@ -2,22 +2,29 @@ package kr.co.metabuild.kotris.file.cms;
 
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.ByteBuf;
-import io.netty.buffer.ByteBufUtil;
-import io.netty.channel.*;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelOption;
+import io.netty.channel.EventLoopGroup;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import kr.co.metabuild.kotris.exception.EAIException;
 import kr.co.metabuild.kotris.exception.ResponseCode;
 import kr.co.metabuild.kotris.file.cms.message.Request;
+import kr.co.metabuild.kotris.util.ByteUtil;
+import org.apache.commons.collections4.map.MultiKeyMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.validation.constraints.NotNull;
 import java.io.File;
+import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.BlockingDeque;
 import java.util.concurrent.LinkedBlockingDeque;
@@ -86,6 +93,14 @@ public class CMSNetworkAdaptor {
     private String loggingBasePath;
     private int messageResendCount = 3;
 
+    /**
+     * 동기방식 일괄 파일 전송
+     *
+     * @param request CMS파일전송요청객체
+     * @param fileFullPath 파일경로
+     * @return String 응답코드
+     * @throws Exception 예외발생
+     */
     public String sendFileSync(Request request, String fileFullPath) throws Exception {
 
         String cmsFileName = request.getFileName();
@@ -142,21 +157,213 @@ public class CMSNetworkAdaptor {
                 } else {
                     nextStep = true;
                 }
+            }
+            if (!nextStep) {
+                throw new EAIException("Can not receive [0610] Message.");
+            }
 
-                if (!nextStep) {
-                    throw new EAIException("Can not receive [0610] Message.");
+            String msgId = CMSExtractor.extractMessageId(workStartResponse);
+            String resCode = CMSExtractor.extractResponseCode(workStartResponse);
+
+            if (!msgId.contentEquals("0610")) {
+                logger.error("Expected MessageId : 0610, Received MessageId {}", msgId);
+                throw new EAIException("Expected MessageId : 0610, Received MessageId " + msgId);
+            }
+
+            if (!resCode.contentEquals("000")) {
+                logger.error("Response Code : {}, Message :  {}", resCode, resCodeMessage.get(resCode));
+                return resCode;
+            }
+
+            nextStep = false;
+            ByteBuf fileInfoRecvResponse = null;
+
+
+            while (!nextStep && recallCountNo0640 <= messageResendCount) {
+
+
+                /********************************************************************************************
+                 * . 파일정보수신요청[0630]
+                 ********************************************************************************************/
+                ByteBuf fileInfoRecvRequest = CMSMessage.fileInfoRecvRequest(orgCode, "R", cmsFileName, dataframe, (int) file.length());
+                conn.writeAndFlush(fileInfoRecvRequest).awaitUninterruptibly();
+
+
+                /********************************************************************************************
+                 * . 파일정보수신응답[0640]
+                 ********************************************************************************************/
+                fileInfoRecvResponse = responseQueue.poll(60, TimeUnit.SECONDS);
+                if (fileInfoRecvResponse == null) {
+                    recallCountNo0640++;
+                    logger.debug("[0640] Read Timeout 60초 발생");
+                    logger.debug("[0630] 전문 재전송");
+                    continue;
+                } else {
+                    nextStep = true;
                 }
 
-                // 파일송수신완료 응답(0610/003)
-                logger.debug("TransferType: {}, Request [{}], tx[{}] : {}", "InBound", workStartRequest, "0610", "fileSendCompleteResponse");
+            }
 
+            if (!nextStep) {
+                throw new EAIException("Can not receive [0640] Message.");
+            }
+
+            msgId = CMSExtractor.extractMessageId(fileInfoRecvResponse);
+            resCode = CMSExtractor.extractResponseCode(fileInfoRecvResponse);
+
+            long alRecvSize = CMSExtractor.extractFileInfoFileSize(fileInfoRecvResponse);
+            int exchangeDataframe = CMSExtractor.extractFileInfoDataFrame(fileInfoRecvResponse);
+
+            if (dataframe <= exchangeDataframe) {
+                exchangedDataframe = dataframe;
+            } else {
+                exchangedDataframe = exchangeDataframe;
+            }
+
+            logger.debug("exchangedDataframe : {}", exchangedDataframe);
+
+            if (alRecvSize > 0) {
+                logger.debug("Already Received Bytes : {}", alRecvSize);
+            }
+
+            if (!msgId.contentEquals("0640")) {
+                logger.error("Expected MessageId : 0640, Received MessageId {}", msgId);
+                throw new EAIException("Expected MessageId : 0640, Received MessageId " + msgId);
+            }
+
+            if (!resCode.contentEquals("000")) {
+                logger.error("Response Code : {}, Message :  {}", resCode, resCodeMessage.get(resCode));
+                return resCode;
+            }
+
+            // 기전송 유무를 판단해야 함
+            boolean loop = true;
+            long offset = 0;
+
+
+            // (4096) - DATA_INDEX(43) + 4 ) = data length 전문정보에 들어갈 패킷사이즈는 4096이고 실제 패킷은
+            // 4100이니 4를 더해준다
+            int dataPacketSize = (exchangedDataframe + 4) -DATA_INDEX;
+            logger.debug("data packet size : {}", dataPacketSize);
+
+            long realFileSize = file.length();
+            long sumFileSize = 0L;
+            try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
+
+                MultiKeyMap<Integer, Long> missNumAddrMap = new MultiKeyMap<>();
+                int seq = 1;
+                int block = 1;
+                // Block loop
+                while (loop) {
+                    byte[] data = new byte[dataPacketSize];
+                    int actualLength = 0;
+                    raf.seek(offset);
+                    actualLength = raf.read(data);
+                    sumFileSize += actualLength;
+
+
+                    // 추출한 데이터가 패킷길이보다 부족할때 또는 파일누적길이가 파일사이즈랑 동일할때 마지막단계인걸 안다. <결번요청/확인과정이 포함됨 Step>
+                    // 결국 최종단계!!
+                    if (actualLength < dataPacketSize || realFileSize == sumFileSize) {
+                        byte[] actualBytes = new byte[actualLength];
+                        System.arraycopy(data, 0, actualBytes, 0, actualLength);
+                        data = actualBytes;
+
+                        // 결번 요청을 위한 Offset 주소를 보관
+                        missNumAddrMap.put(block, seq, offset);
+
+                        if (alRecvSize < sumFileSize) {
+                            ByteBuf dataBuf = CMSMessage.dataSend(orgCode, "R", cmsFileName, data, block, seq);
+                            conn.writeAndFlush(dataBuf).awaitUninterruptibly();
+
+                        } else {
+                            // 데이터가 기수신한 만큼은 송신하지 않고 skip
+                            logger.debug("0320 SendData block {}, seq {} Skipped", block, seq);
+                        }
+
+                        missDataSendProcess(cmsFileName, responseQueue, conn, orgCode, dataPacketSize, raf, missNumAddrMap, block, seq);
+                        loop = false;
+
+                    } else {
+                        // 결번 요청을 위한 Offset 주소를 보관
+                        missNumAddrMap.put(block, seq, offset);
+
+                        // 이어보내기 구현 dataSkip
+                        boolean dataSkip = false;
+
+                        if (alRecvSize < sumFileSize) {
+                            ByteBuf dataBuf = CMSMessage.dataSend(orgCode, "R", "", data, block, seq);
+                            conn.writeAndFlush(dataBuf).awaitUninterruptibly();
+                        } else {
+                            // 데이터가 기수신한 만큼은 송신하지 않고 skip
+                            dataSkip = true;
+                        }
+
+                        if (seq >= FINAL_SEQ) {
+                            if (!dataSkip) {
+                                missDataSendProcess(cmsFileName, responseQueue, conn, orgCode, dataPacketSize, raf, missNumAddrMap, block, seq);
+                                seq = 1;
+                                block++;
+                            }
+                        } else {
+                            seq++;
+                        }
+                        offset += dataPacketSize;
+
+                    }
+                }
+            }
+
+
+            /********************************************************************************************
+             * . 파일송신완료요청[0600]
+             ********************************************************************************************/
+            ByteBuf fileSendCompleteRequest = CMSMessage.fileSendCompleteRequest(orgCode, "R", cmsFileName, request.getUserName(), request.getUserPassword(), sendDataStr);
+            conn.writeAndFlush(fileSendCompleteRequest).awaitUninterruptibly();
+
+
+            /********************************************************************************************
+             * . 파일송신완료응답[0610]
+             ********************************************************************************************/
+            ByteBuf fileSendCompleteResponse = responseQueue.poll(60, TimeUnit.SECONDS);
+            msgId = CMSExtractor.extractMessageId(fileSendCompleteResponse);
+            resCode = CMSExtractor.extractResponseCode(fileSendCompleteResponse);
+            if (!msgId.contentEquals("0610")) {
+                logger.error("Expected MessageId : 0610, Received MessageId {}", msgId);
+                throw new EAIException("Expected MessageId : 0610, Received MessageId " + msgId);
+            }
+            if (!resCode.contentEquals("000")) {
+                logger.error("Response Code : {}, Message :  {}", resCode, resCodeMessage.get(resCode));
             }
 
 
 
+            /********************************************************************************************
+             * . 업무종료요청[0600]
+             ********************************************************************************************/
+            ByteBuf workEndRequest = CMSMessage.workEndRequest(orgCode, "R", cmsFileName, request.getUserName(), request.getUserPassword(), sendDataStr);
+            conn.writeAndFlush(workEndRequest).awaitUninterruptibly();
 
 
+            /********************************************************************************************
+             * . 업무종료응답[0610]
+             ********************************************************************************************/
+            ByteBuf workEndResponse = responseQueue.poll(60, TimeUnit.SECONDS);
+            msgId = CMSExtractor.extractMessageId(workEndResponse);
+            resCode = CMSExtractor.extractResponseCode(workEndResponse);
+            if (!msgId.contentEquals("0610")) {
+                logger.error("Expected MessageId : 0610, Received MessageId {}", msgId);
+                throw new EAIException("Expected MessageId : 0610, Received MessageId " + msgId);
+            }
+            if (!resCode.contentEquals("000")) {
+                logger.error("Response Code : {}, Message :  {}", resCode, resCodeMessage.get(resCode));
+                return resCode;
+            }
+            logger.debug("File Send Complete! FileName : {}", cmsFileName);
 
+            if (conn.isActive()) {
+                conn.close().awaitUninterruptibly();
+            }
         } catch (Exception e) {
             // 외부 Connection 실패
             throw new EAIException(ResponseCode.RES_E02.getDesc(), ResponseCode.RES_E02);
@@ -165,17 +372,130 @@ public class CMSNetworkAdaptor {
                 workerGroup.shutdownGracefully();
             }
         }
+        return "000";
+    }
 
+    /**
+     * 결번 확인 및 결번 데이터 송신 처리
+     *
+     * @param fileName 파일명
+     * @param responseQueue 응답큐
+     * @param conn 커넥션 채널
+     * @param orgCode 기관코드
+     * @param dataPacketSize 데이터 패킷 사이즈
+     * @param raf 파일객체
+     * @param missNumAddrMap 결번주소저장맵
+     * @param block 블럭
+     * @param seq 시퀀스
+     * @return resCode 응답코드
+     * @throws Exception 예외처리
+     */
+    private String missDataSendProcess(String fileName, BlockingDeque<ByteBuf> responseQueue, Channel conn, String orgCode, int dataPacketSize, RandomAccessFile raf, MultiKeyMap<Integer, Long> missNumAddrMap, int block, int seq) throws Exception {
+        String resCode;
+        String msgId;
+        boolean missLoop = true;
+
+        while (missLoop) {
+
+            /********************************************************************************************
+             * . 결번확인요청[0620] 송신
+             ********************************************************************************************/
+
+            int recallCountNo0300 = 0;
+            boolean nextStep = false;
+            ByteBuf sendMissDataConfirmResponse = null;
+            while (!nextStep && recallCountNo0300 <= messageResendCount) {
+
+                ByteBuf missConfirmBuf = CMSMessage.missDataConfirmRequest(orgCode, "R", fileName, block, seq);
+                conn.writeAndFlush(missConfirmBuf).awaitUninterruptibly();
+
+
+                /********************************************************************************************
+                 * . 결번확인응답[0300] 수신
+                 ********************************************************************************************/
+                sendMissDataConfirmResponse = responseQueue.poll(60, TimeUnit.SECONDS);
+                if (sendMissDataConfirmResponse == null) {
+                    recallCountNo0300++;
+                    logger.debug("[0300] Read TimeOut 60초 발생");
+                    logger.debug("[0620] 전문재전송...");
+                    continue;
+                } else {
+                    nextStep = true;
+                }
+
+
+            }
+
+            if (!nextStep) {
+                throw new EAIException("Can't Receive [0300] Message.", ResponseCode.RES_E02);
+            }
+
+            msgId = CMSExtractor.extractMessageId(sendMissDataConfirmResponse);
+            resCode = CMSExtractor.extractResponseCode(sendMissDataConfirmResponse);
+            if (!msgId.contentEquals("0300")) {
+                logger.error("Expected MessageId : 0300, Received MessageId {}", msgId);
+                throw new EAIException("Expected MessageId : 0300, Received MessageId " + msgId);
+            }
+            if (!resCode.contentEquals("000")) {
+                logger.error("Response Code : {}, Message :  {}", resCode, resCodeMessage.get(resCode));
+                throw new EAIException("missDataSendProcess fail" + resCode, ResponseCode.RES_E02);
+            }
+
+            int resBlockNo = ByteUtil.extractInt(sendMissDataConfirmResponse, 32, 4);
+            int resMissCount = ByteUtil.extractInt(sendMissDataConfirmResponse, 39, 3);
+
+            // 결번이 한 건이라도 있으면 결번 송신 처리 시작
+            if (resMissCount == 0) {
+                // 결번이 발생하지 않았으면 탈출
+                missLoop = false;
+            } else {
+                // 여기부터 결번 발생
+                int finalSeq = ByteUtil.extractInt(sendMissDataConfirmResponse, 38, 3);
+                String missCheckData = ByteUtil.extractString(sendMissDataConfirmResponse, 42, finalSeq);
+                int[] checkSeq = { 1 };
+
+                final RandomAccessFile missRaf = raf;
+
+                missCheckData.chars().forEach(c -> {
+                    if (c == '0') {
+
+                        /********************************************************************************************
+                         * . 결번 데이터 송신[0310] 송신
+                         ********************************************************************************************/
+                        long missOffset = missNumAddrMap.get(resBlockNo, checkSeq[0]);
+                        byte[] missData = new byte[dataPacketSize];
+                        int missActualLength = 0;
+
+                        try {
+                            missRaf.seek(missOffset);
+                            missActualLength = missRaf.read(missData);
+                            if (missActualLength < dataPacketSize) {
+                                byte[] missActualBytes = new byte[missActualLength];
+                                System.arraycopy(missData, 0, missActualBytes, 0, missActualLength);
+                                missData = missActualBytes;
+                            }
+
+                            // 데이터 전송
+                            ByteBuf missDataBuf = CMSMessage.missDataSend(orgCode, "R", fileName, missData, resBlockNo, checkSeq[0]);
+                            conn.writeAndFlush(missDataBuf).awaitUninterruptibly();
+
+                        } catch (IOException e) {
+                            logger.error("Miss Data Extract Fail", e);
+                        }
+                    }
+                    checkSeq[0]++;
+                });
+            }
+
+        }
         return "000";
     }
 
 
-    private String missDataSendProcess() throws Exception {
-        return null;
-    }
 
 
-    public String recvfileSync() throws Exception {
+
+    public String recvfileSync(Request request, List<String> completeFiles) throws Exception {
         return null;
     }
 

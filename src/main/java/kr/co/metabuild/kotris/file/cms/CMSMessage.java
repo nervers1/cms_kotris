@@ -136,6 +136,22 @@ public class CMSMessage {
         return buff;
     }
 
+
+    /**
+     * 업무종료지시(0600/004)
+     *
+     */
+    public static ByteBuf workEndRequest(String orgCode, String srCode, String fileName, String userId, String password, String sendDateStr) {
+        ByteBuf buff = Unpooled.buffer();
+        buff.writeBytes(makeCommonField("0600", orgCode, srCode, fileName, "000"));
+        buff.writeBytes(ByteUtil.setString(sendDateStr, 10)); // 전문전송일시 AN
+        buff.writeBytes(ByteUtil.setString("004", 3)); // 업무관리정보 N 004
+        buff.writeBytes(ByteUtil.setString(userId, 20)); // 송신자명 A
+        buff.writeBytes(ByteUtil.setString(password, 16)); // 송신자 암호
+        writeLength(buff);
+        return buff;
+    }
+
     /**
      * 업무종료 응답(0600/004)
      *
