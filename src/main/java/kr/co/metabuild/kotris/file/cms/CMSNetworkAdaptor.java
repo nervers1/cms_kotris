@@ -8,18 +8,22 @@ import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioSocketChannel;
+import kr.co.metabuild.kotris.config.AdaptorPropPrefix;
 import kr.co.metabuild.kotris.exception.EAIException;
 import kr.co.metabuild.kotris.exception.ResponseCode;
+import kr.co.metabuild.kotris.file.cms.message.FileInfo;
 import kr.co.metabuild.kotris.file.cms.message.Request;
 import kr.co.metabuild.kotris.util.ByteUtil;
 import org.apache.commons.collections4.map.MultiKeyMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.boot.context.properties.ConfigurationProperties;
 
 import javax.validation.constraints.NotNull;
 import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
+import java.nio.file.*;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.HashMap;
@@ -27,9 +31,12 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.BlockingDeque;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingDeque;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
+@ConfigurationProperties(prefix = AdaptorPropPrefix.CMS_ADAPTOR_PREFIX, ignoreUnknownFields = true)
 public class CMSNetworkAdaptor {
     private static final Logger logger = LoggerFactory.getLogger(CMSNetworkAdaptor.class);
 
@@ -496,22 +503,752 @@ public class CMSNetworkAdaptor {
 
 
     public String recvfileSync(Request request, List<String> completeFiles) throws Exception {
-        return null;
+        int selectedRemotePort = Integer.parseInt(remotePort);
+        String orgCode = request.getOrgCode();
+        EventLoopGroup workerGroup = new NioEventLoopGroup();
+        logger.debug("CMSAdaptor *: to {} : {} ...", remoteHost, remotePort);
+        try {
+            BlockingDeque<ByteBuf> responseQueue = new LinkedBlockingDeque<>();
+            Bootstrap bootstrap = new Bootstrap();
+            bootstrap.group(workerGroup).channel(NioSocketChannel.class).option(ChannelOption.TCP_NODELAY, true).handler(new CMSInitializer(responseQueue));
+            ChannelFuture cf = bootstrap.connect(remoteHost, selectedRemotePort).syncUninterruptibly();
+            Channel conn = cf.channel();
+
+            // 전문전송일시
+            String sendDataStr = ZonedDateTime.now().format(DateTimeFormatter.ofPattern("MMddHHmmss")); // ex) 0306131309
+
+            int recallCountNo0610 = 0;
+            int recallCountNo0630 = 0;
+            boolean isComplete = false;
+            while (!isComplete && recallCountNo0610 <= messageResendCount && recallCountNo0630 <= messageResendCount) {
+
+
+                /********************************************************************************************
+                 * . 업무개시요청[0600] 송신
+                 ********************************************************************************************/
+                ByteBuf workStartRequest = CMSMessage.workStartRequest(orgCode, "S", "", request.getUserName(), request.getUserPassword(), sendDataStr);
+                conn.writeAndFlush(workStartRequest).awaitUninterruptibly();
+
+
+                /********************************************************************************************
+                 * . 업무개시응답[0610] 수신
+                 ********************************************************************************************/
+                ByteBuf workStartResponse = responseQueue.poll(60, TimeUnit.SECONDS);
+                if (workStartResponse == null) {
+                    recallCountNo0610++;
+                    logger.debug("[0610] Read TimeOut 60초 발생");
+                    logger.debug("[0600-001] 전문재전송 ...");
+                    continue;
+                }
+                String msgId = CMSExtractor.extractMessageId(workStartResponse);
+                String resCode = CMSExtractor.extractResponseCode(workStartResponse);
+                if (!msgId.contentEquals("0610")) {
+                    throw new EAIException("Expected MessageId : 0610, Received MessageId " + msgId);
+                }
+                if (!resCode.contentEquals("000")) {
+                    logger.error("Response Code : {}, Message :  {}", resCode, resCodeMessage.get(resCode));
+                    return resCode;
+                }
+
+                boolean nextFile = true;
+                while (nextFile) {
+                    ByteBuf selectionBuf = responseQueue.poll(60, TimeUnit.SECONDS);
+
+                    if (selectionBuf == null) {
+                        logger.debug("[0630] Read TimeOut 60초 발생");
+                        logger.debug("[0600-001] 전문재전송...");
+                        recallCountNo0630++;
+                        break;
+                    }
+                    msgId = CMSExtractor.extractMessageId(selectionBuf);
+
+                    ByteBuf fileInfoRecvRequest = null;
+
+                    switch (msgId) {
+                        case "0630": {
+                            fileInfoRecvRequest = selectionBuf;
+
+                            /********************************************************************************************
+                             * . 파일정보수신요청[0630] 송신
+                             ********************************************************************************************/
+                            break;
+                        }
+                        case "0600": {
+                            /********************************************************************************************
+                             * . 업무종료[0600/004] 송신
+                             ********************************************************************************************/
+                            ByteBuf workEndResponse = CMSMessage.workEndResponse(orgCode, "S", "", request.getUserName(), request.getUserPassword(), sendDataStr);
+                            conn.writeAndFlush(workEndResponse).awaitUninterruptibly();
+                            nextFile = false;
+                            isComplete = true;
+                            continue;
+                        }
+                        default:
+                            break;
+                    }
+
+
+                    /********************************************************************************************
+                     * . 파일정보수신요청[0630] 송신
+                     ********************************************************************************************/
+                    msgId = CMSExtractor.extractMessageId(fileInfoRecvRequest);
+                    resCode = CMSExtractor.extractResponseCode(fileInfoRecvRequest);
+                    if (!msgId.contentEquals("0630")) {
+                        logger.error("Expected MessageId : 0630, Received MessageId " + msgId);
+                        throw new EAIException("Expected MessageId : 0630, Received MessageId " + msgId);
+                    }
+
+                    if (!resCode.contentEquals("000")) {
+                        logger.error("Response Code : {}, Message :  {}", resCode, resCodeMessage.get(resCode));
+                        return resCode;
+                    }
+
+                    String cmdFileName = CMSExtractor.extractFileInfoFileName(fileInfoRecvRequest);
+                    long fileSize = CMSExtractor.extractFileInfoFileSize(fileInfoRecvRequest);
+                    int dataframe = CMSExtractor.extractFileInfoDataFrame(fileInfoRecvRequest);
+                    Path tmpRecvFile = Paths.get(recvTempFilePath, cmdFileName);
+
+                    Path recvTempDir = Paths.get(recvTempFilePath);
+                    if (!Files.exists(recvTempDir)) {
+                        Files.createDirectory(recvTempDir);
+                    }
+
+                    // 이어받기 하지 말고 기존파일 삭제하고 처음부터 받자
+                    long recvFileSize = 0L;
+                    if (Files.notExists(tmpRecvFile)) {
+                        Files.createFile(tmpRecvFile);
+                    } else {
+                        Files.delete(tmpRecvFile);
+                    }
+
+                    /********************************************************************************************
+                     * . 파일정보수신요청[0640] 송신
+                     ********************************************************************************************/
+                    ByteBuf fileInfoRecvResponse = CMSMessage.fileInfoRecvResponse(orgCode, "S", cmdFileName, dataframe, recvFileSize);
+                    conn.writeAndFlush(fileInfoRecvResponse).awaitUninterruptibly();
+
+                    boolean recvLoop = true;
+                    MultiKeyMap<Integer, byte[]> dataMap = new MultiKeyMap<>();
+
+                    int finalBlockNo = 1;
+                    int finalSeq = 1;
+
+                    while (recvLoop) {
+
+                        ByteBuf unknownData = responseQueue.poll(60, TimeUnit.SECONDS);
+
+                        if (unknownData == null) {
+                            logger.debug("Read TimeOut 180초 발생");
+                            logger.debug("Process End ...");
+                            return "reconnect";
+                        }
+                        msgId = CMSExtractor.extractMessageId(unknownData);
+
+                        switch (msgId) {
+                            case "0320": {
+                                /********************************************************************************************
+                                 * . 데이터송신[0320] 송신
+                                 ********************************************************************************************/
+                                byte[] data = CMSExtractor.extractDataSendData(unknownData);
+                                int blockNo = CMSExtractor.extractDataSendBlockNo(unknownData);
+                                int seq = CMSExtractor.extractDataSendSeq(unknownData);
+                                dataMap.put(blockNo, seq, data);
+                                break;
+                            }
+                            case "310": {
+                                /********************************************************************************************
+                                 * . 결번데이터송신[0310] 송신
+                                 ********************************************************************************************/
+                                byte[] data = CMSExtractor.extractDataSendData(unknownData);
+                                int blockNo = CMSExtractor.extractDataSendBlockNo(unknownData);
+                                int seq = CMSExtractor.extractDataSendSeq(unknownData);
+                                dataMap.put(blockNo, seq, data);
+                                break;
+                            }
+                            case "0620": {
+                                /********************************************************************************************
+                                 * . 결번확인요청[0620] 송신
+                                 ********************************************************************************************/
+                                finalBlockNo = CMSExtractor.extractDataSendBlockNo(unknownData);
+                                finalSeq = CMSExtractor.extractDataSendSeq(unknownData);
+                                StringBuilder missResult = new StringBuilder();
+                                int missCount = 0;
+                                for (int i = 1; i < finalSeq; i++) {
+                                    if (dataMap.containsKey(finalBlockNo, i)) {
+                                        missResult.append("1");
+                                    } else {
+                                        missResult.append("0");
+                                        missCount++;
+                                    }
+                                }
+
+                                /********************************************************************************************
+                                 * . 결번확인응답[0300] 수신
+                                 ********************************************************************************************/
+                                ByteBuf missDataConfirmResponse = CMSMessage.missDataConfirmResponse(orgCode, "S", cmdFileName, finalBlockNo, finalSeq, missCount, missResult.toString());
+                                conn.writeAndFlush(missDataConfirmResponse).awaitUninterruptibly();
+                                break;
+                            }
+                            case "0600": {
+                                /********************************************************************************************
+                                 * . 데이터송신완료[0600] 송신
+                                 ********************************************************************************************/
+                                msgId = CMSExtractor.extractMessageId(unknownData);
+                                resCode = CMSExtractor.extractResponseCode(unknownData);
+                                if (!msgId.contentEquals("0600")) {
+                                    logger.error("Expected MessageId : 0600, Received MessageId " + msgId);
+                                    throw new EAIException("Expected MessageId : 0600, Received MessageId " + msgId);
+                                }
+                                if (!resCode.contentEquals("000")) {
+                                    logger.error("Response Code : {}, Message :  {}", resCode, resCodeMessage.get(resCode));
+                                    return resCode;
+                                }
+
+                                String workAdminInfo = CMSExtractor.extractFileInfoFileName(unknownData);
+                                switch (workAdminInfo) {
+                                    case "002":
+                                        logger.debug("nextFile Exist");
+                                        break;
+                                    case "003":
+                                        logger.debug("FinalFile End ...");
+                                        break;
+                                    default:
+                                        break;
+                                }
+
+                                // 파일을 저장하고
+                                for (int i = 1; i <= finalBlockNo; i++) {
+                                    int seq = 1;
+                                    while (true) {
+                                        byte[] data = dataMap.get(i, seq);
+                                        if (data == null) {
+                                            break;
+                                        }
+                                        Files.write(tmpRecvFile, data, StandardOpenOption.CREATE, StandardOpenOption.APPEND, StandardOpenOption.WRITE);
+                                        seq++;
+                                    }
+                                }
+                                logger.debug("Received FileSize : {}, RealFileSize : {}", fileSize, Files.size(tmpRecvFile));
+                                /********************************************************************************************
+                                 * . 데이터송신완료[0610] 송신
+                                 ********************************************************************************************/
+                                Path recvDir = Paths.get(recvFilePath);
+
+                                if (!Files.exists(recvDir)) {
+                                    Files.createDirectories(recvDir);
+                                }
+
+                                Files.move(tmpRecvFile, Paths.get(recvDir.toString(), tmpRecvFile.getFileName().toString()), StandardCopyOption.REPLACE_EXISTING);
+                                ByteBuf fileSendCompleteResponse = CMSMessage.fileSendCompleteResponse(orgCode, "S", cmdFileName, request.getUserName(), request.getUserPassword(), sendDataStr, workAdminInfo);
+
+                                completeFiles.add(cmdFileName);
+                                conn.writeAndFlush(fileSendCompleteResponse).awaitUninterruptibly();
+                                recvLoop = false;
+                            }
+                            default:
+                                break;
+                        }
+                    }
+
+
+                }
+
+
+            }
+
+            if (conn.isActive()) {
+                conn.close().awaitUninterruptibly();
+            }
+
+            if (!isComplete) {
+                throw new EAIException("Can not Receive Message ...", ResponseCode.RES_E02);
+            }
+
+            logger.debug("처리 완료");
+            return "000";
+        } catch (Exception e) {
+            throw new EAIException("Can not Receive Message ...", ResponseCode.RES_E02, e);
+        } finally {
+            if (!workerGroup.isShutdown()) {
+                workerGroup.shutdownGracefully();
+            }
+        }
     }
 
 
-    public String recvfileSyncFileInfo() throws Exception {
-        return null;
+    public String recvfileSyncFileInfo(Request request, List<FileInfo> completeFiles) throws Exception {
+        int selectedRemotePort = Integer.parseInt(remotePort);
+        String orgCode = request.getOrgCode();
+        EventLoopGroup workerGroup = new NioEventLoopGroup();
+        logger.debug("CMSAdaptor *: to {} : {} ...", remoteHost, remotePort);
+        try {
+            BlockingQueue<ByteBuf> responseQueue = new LinkedBlockingQueue<>();
+            Bootstrap bootstrap = new Bootstrap();
+            bootstrap.group(workerGroup).channel(NioSocketChannel.class).option(ChannelOption.TCP_NODELAY, true).handler(new CMSInitializer(responseQueue));
+            ChannelFuture cf = bootstrap.connect(remoteHost, selectedRemotePort).syncUninterruptibly();
+            Channel conn = cf.channel();
+
+            // 전문전송일시
+            String sendDataStr = ZonedDateTime.now().format(DateTimeFormatter.ofPattern("MMddHHmmss")); // ex) 0306131309
+
+            /********************************************************************************************
+             * . 업무개시요청[0600] 송신
+             ********************************************************************************************/
+            ByteBuf workStartRequest = CMSMessage.workStartRequest(orgCode, "S", "", request.getUserName(), request.getUserPassword(), sendDataStr);
+            conn.writeAndFlush(workStartRequest).awaitUninterruptibly();
+
+            /********************************************************************************************
+             * . 업무개시응답[0600] 수신
+             ********************************************************************************************/
+            ByteBuf workStartResponse = responseQueue.poll(60, TimeUnit.SECONDS);
+            if (workStartResponse == null) {
+                throw new EAIException("[0610] Read TimeOut 60초 발생", ResponseCode.RES_E02);
+            }
+            String msgId = CMSExtractor.extractMessageId(workStartResponse);
+            String resCode = CMSExtractor.extractResponseCode(workStartResponse);
+            if (!msgId.contentEquals("0610")) {
+                throw new EAIException("Expected MessageId : 0610, Received MessageId " + msgId);
+            }
+            if (!resCode.contentEquals("000")) {
+                logger.error("Response Code : {}, Message :  {}", resCode, resCodeMessage.get(resCode));
+                return resCode;
+            }
+
+            boolean nextFile = true;
+            while (nextFile) {
+
+                ByteBuf selectionBuf = responseQueue.poll(60, TimeUnit.SECONDS);
+                msgId = CMSExtractor.extractFileInfoFileName(selectionBuf);
+
+                ByteBuf fileInfoRecvRequest = null;
+
+                switch (msgId) {
+                    case "0630": {
+                        fileInfoRecvRequest = selectionBuf;
+
+                        /********************************************************************************************
+                         * . 파일정보수신요청[0630] 송신
+                         ********************************************************************************************/
+                        break;
+                    }
+                    case "0600": {
+
+                        /********************************************************************************************
+                         * . 업무종료요청[0600/004] 송신
+                         ********************************************************************************************/
+                        ByteBuf workEndResponse = CMSMessage.workEndResponse(orgCode, "S", "", request.getUserName(), request.getUserPassword(), sendDataStr);
+                        conn.writeAndFlush(workEndResponse).awaitUninterruptibly();
+                        nextFile = false;
+                        continue;
+                    }
+                    default:
+                        break;
+                }
+
+                /********************************************************************************************
+                 * . 파일정보수신요청[0630] 송신
+                 ********************************************************************************************/
+                msgId = CMSExtractor.extractMessageId(fileInfoRecvRequest);
+                resCode = CMSExtractor.extractResponseCode(fileInfoRecvRequest);
+                if (!msgId.contentEquals("0630")) {
+                    logger.error("Expected MessageId : 0630, Received MessageId " + msgId);
+                    throw new EAIException("Expected MessageId : 0630, Received MessageId " + msgId);
+                }
+
+                if (!resCode.contentEquals("000")) {
+                    logger.error("Response Code : {}, Message :  {}", resCode, resCodeMessage.get(resCode));
+                    return resCode;
+                }
+
+                String cmsFileName = CMSExtractor.extractFileInfoFileName(fileInfoRecvRequest);
+                long fileSize = CMSExtractor.extractFileInfoFileSize(fileInfoRecvRequest);
+                int dataframe = CMSExtractor.extractFileInfoDataFrame(fileInfoRecvRequest);
+                Path tmpRecvFile = Paths.get(recvTempFilePath, cmsFileName);
+
+                Path recvTempDir = Paths.get(recvTempFilePath);
+                if (!Files.exists(recvTempDir)) {
+                    Files.createDirectory(recvTempDir);
+                }
+
+                // 이어받기 하지 말고 기존파일 삭제하고 처음부터 받자
+                long recvFileSize = 0L;
+                if (Files.notExists(tmpRecvFile)) {
+                    Files.createFile(tmpRecvFile);
+                } else {
+                    Files.delete(tmpRecvFile);
+                }
+
+                /********************************************************************************************
+                 * . 파일정보수신요청[0640] 송신
+                 ********************************************************************************************/
+                ByteBuf fileInfoRecvResponse = CMSMessage.fileInfoRecvResponse(orgCode, "S", cmsFileName, dataframe, recvFileSize);
+                conn.writeAndFlush(fileInfoRecvResponse).awaitUninterruptibly();
+
+                boolean recvLoop = true;
+                MultiKeyMap<Integer, byte[]> dataMap = new MultiKeyMap<>();
+
+                int finalBlockNo = 1;
+                int finalSeq = 1;
+
+                while (recvLoop) {
+
+                    ByteBuf unknownData = responseQueue.poll(60, TimeUnit.SECONDS);
+                    msgId = CMSExtractor.extractMessageId(unknownData);
+
+                    switch (msgId) {
+
+                        case "0320": {
+
+                            /********************************************************************************************
+                             * . 데이터송신[0320] 송신
+                             ********************************************************************************************/
+                            byte[] data = CMSExtractor.extractDataSendData(unknownData);
+                            int blockNo = CMSExtractor.extractDataSendBlockNo(unknownData);
+                            int seq = CMSExtractor.extractDataSendSeq(unknownData);
+                            dataMap.put(blockNo, seq, data);
+                            break;
+                        }
+                        case "0310": {
+
+                            /********************************************************************************************
+                             * . 결번데이터송신[0310] 송신
+                             ********************************************************************************************/
+                            byte[] data = CMSExtractor.extractDataSendData(unknownData);
+                            int blockNo = CMSExtractor.extractDataSendBlockNo(unknownData);
+                            int seq = CMSExtractor.extractDataSendSeq(unknownData);
+                            dataMap.put(blockNo, seq, data);
+                            break;
+
+                        }
+                        case "0620": {
+                            /********************************************************************************************
+                             * . 결번확인응답[0620] 수신
+                             ********************************************************************************************/
+                            finalBlockNo = CMSExtractor.extractDataSendBlockNo(unknownData);
+                            finalSeq = CMSExtractor.extractDataSendSeq(unknownData);
+                            StringBuilder missResult = new StringBuilder();
+                            int missCount = 0;
+                            for (int i = 1; i <= finalSeq; i++) {
+                                if (dataMap.containsKey(finalBlockNo, i)) {
+                                    missResult.append("1");
+                                } else {
+                                    missResult.append("0");
+                                    missCount++;
+                                }
+                            }
+
+                            /********************************************************************************************
+                             * . 결번확인요청[0300] 송신
+                             ********************************************************************************************/
+                            ByteBuf missDataConfirmResponse = CMSMessage.missDataConfirmResponse(orgCode, "S", cmsFileName, finalBlockNo, finalSeq, missCount, missResult.toString());
+                            conn.writeAndFlush(missDataConfirmResponse).awaitUninterruptibly();
+                            break;
+                        }
+                        case "0600": {
+
+                            /********************************************************************************************
+                             * . 송신완료요청[0600] 송신
+                             ********************************************************************************************/
+                            msgId = CMSExtractor.extractMessageId(unknownData);
+                            resCode = CMSExtractor.extractResponseCode(unknownData);
+                            if (!msgId.contentEquals("0600")) {
+                                logger.error("Expected MessageId : 0600, Received MessageId " + msgId);
+                                throw new EAIException("Expected MessageId : 0600, Received MessageId " + msgId);
+                            }
+                            if (!resCode.contentEquals("000")) {
+                                logger.error("Response Code : {}, Message :  {}", resCode, resCodeMessage.get(resCode));
+                                return resCode;
+                            }
+
+                            String workAdminInfo = CMSExtractor.extractWorkAdminInfo(unknownData);
+                            switch (workAdminInfo) {
+                                case "002":
+                                    logger.debug("nextFile Exist");
+                                    break;
+                                case "003":
+                                    logger.debug("FinalFile End ...");
+                                    break;
+                                default:
+                                    break;
+                            }
+
+                            // 파일 저장
+                            for (int i = 0; i < finalBlockNo; i++) {
+                                int seq = 1;
+                                while (true) {
+                                    byte[] data = dataMap.get(i, seq);
+                                    if (data == null) {
+                                        break;
+                                    }
+                                    Files.write(tmpRecvFile, data, StandardOpenOption.CREATE, StandardOpenOption.APPEND, StandardOpenOption.WRITE);
+                                    seq++;
+                                }
+                            }
+                            logger.debug("Received FileSize : {}, RealFileSize : {}", fileSize, Files.size(tmpRecvFile));
+
+                            /********************************************************************************************
+                             * . 송신완료요청[0610] 송신
+                             ********************************************************************************************/
+                            Path recvDir = Paths.get(recvFilePath);
+
+                            if (!Files.exists(recvDir)) {
+                                Files.createDirectory(recvDir);
+                            }
+
+                            Files.move(tmpRecvFile, Paths.get(recvDir.toString(), tmpRecvFile.getFileName().toString()), StandardCopyOption.REPLACE_EXISTING);
+
+                            long fsize = Files.size(Paths.get(recvDir.toString(), tmpRecvFile.getFileName().toString()));
+                            ByteBuf fileSendCompleteResponse = CMSMessage.fileSendCompleteResponse(orgCode, "S", cmsFileName, request.getUserName(), request.getUserPassword(), sendDataStr);
+                            FileInfo finfo = new FileInfo();
+                            finfo.setName(cmsFileName);
+                            finfo.setSize(fsize);
+                            completeFiles.add(finfo);
+                            recvLoop = false;
+
+                        }
+
+                        default:
+                            break;
+
+                    }
+                }
+
+
+            }
+
+
+            if (conn.isActive()) {
+                conn.close().awaitUninterruptibly();
+            }
+
+            logger.debug("처리 완료");
+            return "000";
+        } catch (Exception e) {
+            throw new EAIException("Can not Receive Message ...", ResponseCode.RES_E02, e);
+        } finally {
+            if (!workerGroup.isShutdown()) {
+                workerGroup.shutdownGracefully();
+            }
+        }
+
     }
 
 
-    public String fileInquiry() throws Exception {
-        return null;
+    public String fileInquiry(Request request) throws Exception {
+
+        int selectedRemotePort = Integer.parseInt(remotePort);
+
+        String cmsFileName = request.getFileName();
+        String yyyymmdd = request.getYyyymmdd();
+        String orgCode = request.getOrgCode();
+
+        EventLoopGroup workerGroup = new NioEventLoopGroup();
+        logger.debug("CMSAdaptor *: to {} : {} ...", remoteHost, remotePort);
+        try {
+            BlockingQueue<ByteBuf> responseQueue = new LinkedBlockingQueue<>();
+            Bootstrap bootstrap = new Bootstrap();
+            bootstrap.group(workerGroup).channel(NioSocketChannel.class).option(ChannelOption.TCP_NODELAY, true).handler(new CMSInitializer(responseQueue));
+            ChannelFuture cf = bootstrap.connect(remoteHost, selectedRemotePort).syncUninterruptibly();
+            Channel conn = cf.channel();
+
+            // 전문송신일시
+            String sendDataStr = ZonedDateTime.now().format(DateTimeFormatter.ofPattern("MMddHHmmss")); // ex) 0306131309
+
+            /********************************************************************************************
+             * . 업무개시요청[0600] 송신
+             ********************************************************************************************/
+            ByteBuf workStartRequest = CMSMessage.workStartRequest(orgCode, "R", "", request.getUserName(), request.getUserPassword(), sendDataStr);
+            conn.writeAndFlush(workStartRequest).awaitUninterruptibly();
+
+            /********************************************************************************************
+             * . 업무개시응답[0610] 수신
+             ********************************************************************************************/
+            ByteBuf workStartResponse = responseQueue.poll(60, TimeUnit.SECONDS);
+            String msgId = CMSExtractor.extractMessageId(workStartResponse);
+            String resCode = CMSExtractor.extractResponseCode(workStartResponse);
+
+            if (!msgId.contentEquals("0610")) {
+                logger.error("Expected MessageId : 0610, Received MessageId " + msgId);
+                throw new EAIException("Expected MessageId : 0610, Received MessageId " + msgId);
+            }
+
+            if (!resCode.contentEquals("000")) {
+                logger.error("Response Code : {}, Message :  {}", resCode, resCodeMessage.get(resCode));
+                return resCode;
+            }
+
+
+            /********************************************************************************************
+             * . 파일조회요청[0400] 송신
+             ********************************************************************************************/
+            ByteBuf fileInquiryRequest = CMSMessage.fileInquiryRequest(orgCode, "R", cmsFileName, yyyymmdd);
+            conn.writeAndFlush(fileInquiryRequest).awaitUninterruptibly();
+
+
+            /********************************************************************************************
+             * . 파일조회응답[0410] 수신
+             ********************************************************************************************/
+            ByteBuf fileInquiryResponse = responseQueue.poll(60, TimeUnit.SECONDS);
+            msgId = CMSExtractor.extractMessageId(fileInquiryResponse);
+            resCode = CMSExtractor.extractResponseCode(fileInquiryResponse);
+            String resultCode = CMSExtractor.extractFileInquiryResultCode(fileInquiryResponse);
+            if (!msgId.contentEquals("0410")) {
+                logger.error("Expected MessageId : 0410, Received MessageId " + msgId);
+                throw new EAIException("Expected MessageId : 0410, Received MessageId " + msgId);
+            }
+
+            if (!resCode.contentEquals("000")) {
+                logger.error("Response Code : {}, Message :  {}", resCode, resCodeMessage.get(resCode));
+                return resCode;
+            }
+
+
+            /********************************************************************************************
+             * . 업무종료요청[0600] 송신
+             ********************************************************************************************/
+            ByteBuf workEndRequest = CMSMessage.workEndRequest(orgCode, "R", "", request.getUserName(), request.getUserPassword(), sendDataStr);
+            conn.writeAndFlush(workEndRequest).awaitUninterruptibly();
+
+
+            /********************************************************************************************
+             * . 업무종료응답[0610] 수신
+             ********************************************************************************************/
+            ByteBuf workEndResponse = responseQueue.poll(60, TimeUnit.SECONDS);
+            msgId = CMSExtractor.extractMessageId(workEndResponse);
+            resCode = CMSExtractor.extractResponseCode(workEndResponse);
+
+            if (!msgId.contentEquals("0610")) {
+                logger.error("Expected MessageId : 0610, Received MessageId " + msgId);
+                throw new EAIException("Expected MessageId : 0610, Received MessageId " + msgId);
+            }
+
+            if (!resCode.contentEquals("000")) {
+                logger.error("Response Code : {}, Message :  {}", resCode, resCodeMessage.get(resCode));
+                return resCode;
+            }
+
+            if (conn.isActive()) {
+                conn.close().awaitUninterruptibly();
+            }
+
+            logger.debug("처리 완료");
+            return resultCode;
+
+        } catch (Exception e) {
+            logger.error("Error : {}", e);
+            throw new EAIException("Can not Connect ...", ResponseCode.RES_E02, e);
+        }
     }
 
 
-    public String fileCancel() throws Exception {
-        return null;
+    public String fileCancel(Request request) throws Exception {
+
+        int selectedRemotePort = Integer.parseInt(remotePort);
+
+        String cmsFileName = request.getFileName();
+        String yyyymmdd = request.getYyyymmdd();
+        String orgCode = request.getOrgCode();
+
+        EventLoopGroup workerGroup = new NioEventLoopGroup();
+        logger.debug("CMSAdaptor *: to {} : {} ...", remoteHost, remotePort);
+
+        try {
+            BlockingDeque<ByteBuf> responseQueue = new LinkedBlockingDeque<>();
+            Bootstrap bootstrap = new Bootstrap();
+            bootstrap.group(workerGroup).channel(NioSocketChannel.class).option(ChannelOption.TCP_NODELAY, true).handler(new CMSInitializer(responseQueue));
+            ChannelFuture cf = bootstrap.connect(remoteHost, selectedRemotePort).syncUninterruptibly();
+            Channel conn = cf.channel();
+
+            // 전문송신일시
+            String sendDataStr = ZonedDateTime.now().format(DateTimeFormatter.ofPattern("MMddHHmmss")); // ex) 0306131309
+
+
+            /********************************************************************************************
+             * . 업무개시요청[0600] 송신
+             ********************************************************************************************/
+            ByteBuf workStartRequest = CMSMessage.workStartRequest(orgCode, "R", "", request.getUserName(), request.getUserPassword(), sendDataStr);
+            conn.writeAndFlush(workStartRequest).awaitUninterruptibly();
+
+
+            /********************************************************************************************
+             * . 업무개시응답[0600] 수신
+             ********************************************************************************************/
+            ByteBuf workStartResponse = responseQueue.poll(60, TimeUnit.SECONDS);
+            String msgId = CMSExtractor.extractMessageId(workStartResponse);
+            String resCode = CMSExtractor.extractResponseCode(workStartResponse);
+
+            if (!msgId.contentEquals("0610")) {
+                logger.error("Expected MessageId : 0610, Received MessageId " + msgId);
+                throw new EAIException("Expected MessageId : 0610, Received MessageId " + msgId);
+            }
+
+            if (!resCode.contentEquals("000")) {
+                logger.error("Response Code : {}, Message : {}", resCode, resCodeMessage.get(resCode));
+                return resCode;
+            }
+
+
+            /********************************************************************************************
+             * . 파일조회요청[0400] 송신
+             ********************************************************************************************/
+            ByteBuf fileCancelRequest = CMSMessage.fileCancelRequest(orgCode, "R", cmsFileName, yyyymmdd);
+            conn.writeAndFlush(fileCancelRequest).awaitUninterruptibly();
+
+
+            /********************************************************************************************
+             * . 파일조회응답[0410] 수신
+             ********************************************************************************************/
+            ByteBuf fileCancelResponse = responseQueue.poll(60, TimeUnit.SECONDS);
+            msgId = CMSExtractor.extractMessageId(fileCancelResponse);
+            resCode = CMSExtractor.extractResponseCode(fileCancelResponse);
+            String resultCode = CMSExtractor.extractFileInquiryResultCode(fileCancelResponse);
+
+            if (!msgId.contentEquals("0510")) {
+                logger.error("Expected MessageId : 0510, Received MessageId " + msgId);
+                throw new EAIException("Expected MessageId : 0510, Received MessageId " + msgId);
+            }
+
+            if (!resCode.contentEquals("000")) {
+                logger.error("Response Code : {}, Message :  {}", resCode, resCodeMessage.get(resCode));
+                return resCode;
+            }
+
+
+            /********************************************************************************************
+             * . 업무종료요청[0600] 송신
+             ********************************************************************************************/
+            ByteBuf workEndRequest = CMSMessage.workEndRequest(orgCode, "R", "", request.getUserName(), request.getUserPassword(), sendDataStr);
+            conn.writeAndFlush(workEndRequest).awaitUninterruptibly();
+
+
+            /********************************************************************************************
+             * . 업무종료요청[0610] 수신
+             ********************************************************************************************/
+            ByteBuf workEndResponse = responseQueue.poll(60, TimeUnit.SECONDS);
+            msgId = CMSExtractor.extractMessageId(workEndResponse);
+            resCode = CMSExtractor.extractResponseCode(workEndResponse);
+
+            if (!msgId.contentEquals("0610")) {
+                logger.error("Expected MessageId : 0610, Received MessageId " + msgId);
+                throw new EAIException("Expected MessageId : 0610, Received MessageId " + msgId);
+            }
+
+            if (!resCode.contentEquals("000")) {
+                logger.error("Response Code : {}, Message : {}", resCode, resCodeMessage.get(resCode));
+                return resCode;
+            }
+
+            if (conn.isActive()) {
+                conn.close().awaitUninterruptibly();
+            }
+
+            logger.debug("처리 완료");
+            return resultCode;
+
+        } catch (Exception e) {
+            logger.error("Can not Receive Message ...", ResponseCode.RES_E02, e);
+            throw new EAIException("Can not Receive Message ...", ResponseCode.RES_E02, e);
+        }
     }
 
 
@@ -537,6 +1274,8 @@ public class CMSNetworkAdaptor {
         }
         logger.debug("Stop.. ");
     }
+
+
 
 
 

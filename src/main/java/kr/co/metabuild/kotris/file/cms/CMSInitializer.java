@@ -5,12 +5,12 @@ import io.netty.channel.ChannelInitializer;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.handler.codec.LengthFieldBasedFrameDecoder;
 
-import java.util.concurrent.BlockingDeque;
+import java.util.concurrent.BlockingQueue;
 
 public class CMSInitializer extends ChannelInitializer<SocketChannel> {
-    BlockingDeque<ByteBuf> responseQueue;
+    BlockingQueue<ByteBuf> responseQueue;
 
-    public CMSInitializer(BlockingDeque<ByteBuf> responseQueue) {
+    public CMSInitializer(BlockingQueue<ByteBuf> responseQueue) {
         this.responseQueue = responseQueue;
     }
 

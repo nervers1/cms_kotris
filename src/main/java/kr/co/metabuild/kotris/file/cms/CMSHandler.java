@@ -7,13 +7,13 @@ import io.netty.channel.ChannelInboundHandlerAdapter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.concurrent.BlockingDeque;
+import java.util.concurrent.BlockingQueue;
 
 public class CMSHandler extends ChannelInboundHandlerAdapter {
     private static final Logger logger = LoggerFactory.getLogger(CMSHandler.class);
-    BlockingDeque<ByteBuf> responseQueue;
+    BlockingQueue<ByteBuf> responseQueue;
 
-    public CMSHandler(BlockingDeque<ByteBuf> responseQueue) {
+    public CMSHandler(BlockingQueue<ByteBuf> responseQueue) {
         this.responseQueue = responseQueue;
     }
 
